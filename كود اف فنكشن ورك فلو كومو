@@ -1,0 +1,141 @@
+// إعداد المتغيرات
+const SUBDOMAIN   = "infodvnlogcom";   // ✅ دومينك في Kommo بدون <subdomain>
+const PIPELINE_ID = 11613083;
+const STATUS_ID   = 89191851;
+const TAG_NAME    = "MonthlyTax";
+
+function createCustomFieldsValues(phones, emails) {
+  const arr = [];
+  if (phones?.length) {
+    arr.push({
+      field_code: "PHONE",
+      values: phones.map(p => ({ value: p.trim(), enum_code: "WORK" }))
+    });
+  }
+  if (emails?.length) {
+    arr.push({
+      field_code: "EMAIL",
+      values: emails.map(e => ({ value: e.trim(), enum_code: "WORK" }))
+    });
+  }
+  return arr;
+}
+
+function buildLeadName(companyName, document) {
+  const months = {
+    "Ekim": "Oct", "Kasım": "Nov", "Aralık": "Dec",
+    "Ocak": "Jan", "Şubat": "Feb", "Mart": "Mar",
+    "Nisan": "Apr", "Mayıs": "May", "Haziran": "Jun",
+    "Temmuz": "Jul", "Ağustos": "Aug", "Eylül": "Sep"
+  };
+  let monthYear = "";
+  if (document?.name) {
+    const match = document.name.match(/([A-Za-z\u0600-\u06FF]+)\s?(\d{4})/);
+    if (match) {
+      let month = months[match[1]] || match[1];
+      monthYear = `${month} ${match[2]}`;
+    }
+  }
+  if (!monthYear) {
+    const now = new Date();
+    const m = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    monthYear = `${m[now.getMonth()]} ${now.getFullYear()}`;
+  }
+  return `${companyName} - ${monthYear} Tax`;
+}
+
+function mergeTags(oldTags, newTag) {
+  let tags = [];
+  if (Array.isArray(oldTags)) {
+    tags = oldTags.map(t => (typeof t === "string" ? { name: t } : t));
+    if (!tags.some(t => t.name === newTag)) tags.push({ name: newTag });
+  } else {
+    tags = [{ name: newTag }];
+  }
+  return tags;
+}
+
+return $input.all().flatMap(item => {
+  const d = item.json;
+  const operations = [];
+
+  const companyName = d.companyName || "";
+  const firstName = d.firstName || "";
+  const lastName  = d.lastName || "";
+
+  // ✅ إجبار اسم العميل على First + Last فقط
+  const fullName = `${firstName} ${lastName}`.trim();
+
+  const phones = d.originalData?.contact_phone?.split(",").map(x=>x.trim()) || [];
+  const emails = d.email ? [d.email.trim()] : d.originalData?.contact_email ? [d.originalData.contact_email.trim()] : [];
+
+  const customFields = createCustomFieldsValues(phones, emails);
+
+  // ✅ تعديل هنا ليكون اسم الـ Lead هو fullName فقط
+  const leadName = fullName;
+
+  if (!d.leadData) {
+    // ✅ إنشاء lead جديد + contact + company في POST واحد مع التاجز
+    operations.push({
+      method: "POST",
+      url: `https://${SUBDOMAIN}.kommo.com/api/v4/leads/complex`,
+      payload: {
+        name: leadName, // ✅ استخدام اسم العميل فقط
+        pipeline_id: PIPELINE_ID,
+        status_id: STATUS_ID,
+        _embedded: {
+          tags: mergeTags([], TAG_NAME), // ✅ إضافة التاجز بشكل صحيح
+          companies: [{ name: companyName }],
+          contacts: [
+            {
+              first_name: firstName,
+              last_name: lastName,
+              name: fullName, // ✅ اسم العميل من First + Last فقط
+              custom_fields_values: customFields
+            }
+          ]
+        }
+      }
+    });
+  } else {
+    // ✅ تحديث lead موجود
+    const mergedTags = mergeTags(d.leadData.tags, TAG_NAME);
+    operations.push({
+      method: "PATCH",
+      url: `https://${SUBDOMAIN}.kommo.com/api/v4/leads/${d.leadData.id}`,
+      payload: {
+        name: leadName, // ✅ استخدام اسم العميل فقط
+        pipeline_id: PIPELINE_ID,
+        status_id: STATUS_ID,
+        _embedded: {
+          tags: mergedTags,
+          companies: d.leadData.companies?.map(cid => ({ id: cid })) || []
+        }
+      }
+    });
+
+    // ✅ تحديث contact لو اتغيرت بياناته
+    if (d.contactData?.id) {
+      const oldPhones = (d.contactData.phones || []).map(x => x.replace(/\s+/g, ""));
+      const newPhones = phones.map(x => x.replace(/\s+/g, ""));
+      const phoneChanged = oldPhones.join(",") !== newPhones.join(",");
+
+      const emailChanged = (d.contactData.emails || []).join(",") !== emails.join(",");
+
+      if (phoneChanged || emailChanged || d.contactData.first_name !== firstName || d.contactData.last_name !== lastName) {
+        operations.push({
+          method: "PATCH",
+          url: `https://${SUBDOMAIN}.kommo.com/api/v4/contacts/${d.contactData.id}`,
+          payload: {
+            first_name: firstName,
+            last_name: lastName,
+            name: fullName,
+            custom_fields_values: customFields
+          }
+        });
+      }
+    }
+  }
+
+  return operations;
+});
